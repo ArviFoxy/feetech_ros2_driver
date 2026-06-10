@@ -196,6 +196,20 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
 
     // Only enable torque for joints with command interfaces (Follower Arm)
     if (!joint.command_interfaces.empty()) {
+      // Sync the volatile Goal_Position register to the present position BEFORE
+      // enabling torque. The goal survives across sessions while the bus stays
+      // powered; if the homing offset was just rewritten the stale goal is
+      // reinterpreted in the new frame and the servo JUMPS on torque-on (seen on
+      // wrist_roll: ~49° lunge into a mechanical jam + overload cutoff).
+      const auto present = communication_protocol_->read_position(joint_ids_[i]);
+      if (!present) {
+        spdlog::error("FeetechHardwareInterface::configure_joints_ read_position -> {}", present.error());
+        return CallbackReturn::ERROR;
+      }
+      if (const auto result = communication_protocol_->write_position(joint_ids_[i], *present, 0, 0); !result) {
+        spdlog::error("FeetechHardwareInterface::configure_joints_ goal sync -> {}", result.error());
+        return CallbackReturn::ERROR;
+      }
       if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
         spdlog::error("FeetechHardwareInterface::configure_joints_ set_torque -> {}", result.error());
         return CallbackReturn::ERROR;
