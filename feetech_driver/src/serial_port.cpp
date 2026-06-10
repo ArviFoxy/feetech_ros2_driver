@@ -1,5 +1,8 @@
 #include <spdlog/spdlog.h>
+#include <sys/file.h>
 
+#include <cerrno>
+#include <cstring>
 #include <feetech_driver/serial_port.hpp>
 
 namespace feetech_driver {
@@ -99,6 +102,18 @@ Result SerialPort::open() {
   try {
     if (!port_.IsOpen()) {
       port_.Open(dev_);
+      // Single-master guard: the kernel allows any number of openers on a tty,
+      // so two controller instances would silently interleave packets on the
+      // half-duplex servo bus. Take an exclusive advisory lock for the lifetime
+      // of this fd; it is released automatically on close or process death.
+      if (::flock(port_.GetFileDescriptor(), LOCK_EX | LOCK_NB) != 0) {
+        const int err = errno;
+        (void)close();
+        return tl::make_unexpected(
+            fmt::format("Serial port [{}] is locked by another process (flock: {}) — "
+                        "is another controller instance already running?",
+                        dev_, std::strerror(err)));
+      }
     }
   } catch (const LibSerial::OpenFailed& e) {
     return tl::make_unexpected(fmt::format("Open [{}]: {}", dev_.c_str(), e.what()));
