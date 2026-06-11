@@ -10,6 +10,8 @@ The feetech system interface has a few `ros2_control` urdf tags to customize its
 
 * `usb_port` (required). Example: `<param name="usb_port">/dev/ttyUSB0</param>`.
 * `joint_config_file` (optional): Path to a YAML file with per-joint parameters. If omitted, only URDF params are used (backward-compatible). See [YAML Joint Configuration](#yaml-joint-configuration-file) below.
+* `goal_speed` (optional, default 2400): Speed value (0–2400 steps/s, 0 = unlimited) written with **every** position command. The servo re-profiles each goal with this on top of whatever time-parameterization the controller already applied — be aware of the double profiling when tuning trajectory tracking.
+* `goal_acceleration` (optional, default 50): Acceleration value (0–255, ×100 steps/s²) written with every position command. Same double-profiling caveat. Note this is the per-command register (41), distinct from the per-joint EEPROM `acceleration` parameter.
 
 #### Per-joint Parameters
 

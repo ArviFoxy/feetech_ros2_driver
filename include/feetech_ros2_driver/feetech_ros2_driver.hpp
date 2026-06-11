@@ -51,6 +51,14 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
 
   std::vector<uint8_t> joint_ids_;
 
+  // Servo-side motion profile applied to EVERY sync_write goal (registers 41/46-47): the servo
+  // re-profiles each position command with these, ON TOP of whatever time-parameterization the
+  // controller already did. Overridable via the <hardware> params `goal_speed` (0-2400 steps/s,
+  // 0 = unlimited) and `goal_acceleration` (0-255 x100 steps/s^2); defaults preserve the
+  // historical hardcoded values.
+  int goal_speed_ = 2400;
+  int goal_acceleration_ = 50;
+
   CallbackReturn init_transport_();
   CallbackReturn load_yaml_config_and_warn_(JointIdConfigMap& out_yaml);
   CallbackReturn configure_joints_(const JointIdConfigMap& yaml_by_id);
@@ -61,6 +69,7 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   // node restart revives it (observed live: one 5 ms read timeout froze the arm permanently).
   static constexpr int kTorqueRecoveryStreak = 10;  // outage cycles before assuming brownout-reset
   static constexpr int kReconnectEvery = 200;       // outage cycles between port-reopen attempts
+  static constexpr int kStaleEscalateEvery = 50;    // sustained-staleness error-log cadence (~0.5 s @ 100 Hz)
   int consecutive_read_failures_ = 0;
   int consecutive_write_failures_ = 0;
   bool needs_torque_recovery_ = false;

@@ -42,6 +42,26 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
     return CallbackReturn::ERROR;
   }
 
+  // Optional servo-side motion profile (see header): <param name="goal_speed">/<param
+  // name="goal_acceleration"> on the <hardware> block. Defaults keep the historical values, so
+  // existing setups are byte-for-byte unchanged.
+  for (auto [name, member] : {std::pair<const char*, int*>{"goal_speed", &goal_speed_},
+                              std::pair<const char*, int*>{"goal_acceleration", &goal_acceleration_}}) {
+    if (const auto it = info_.hardware_parameters.find(name); it != info_.hardware_parameters.end()) {
+      try {
+        *member = std::stoi(it->second);
+      } catch (const std::exception&) {
+        spdlog::error("FeetechHardwareInterface::on_init invalid {} '{}'", name, it->second);
+        return CallbackReturn::ERROR;
+      }
+    }
+  }
+  if (goal_speed_ < 0 || goal_speed_ > 2400 || goal_acceleration_ < 0 || goal_acceleration_ > 255) {
+    spdlog::error("FeetechHardwareInterface::on_init goal_speed {} (0-2400) / goal_acceleration {} (0-255) out of range",
+                  goal_speed_, goal_acceleration_);
+    return CallbackReturn::ERROR;
+  }
+
   JointIdConfigMap yaml_by_id;
   if (load_yaml_config_and_warn_(yaml_by_id) != CallbackReturn::SUCCESS) {
     return CallbackReturn::ERROR;
@@ -384,6 +404,16 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
       spdlog::warn("FeetechHardwareInterface::read ({} consecutive failures) -> {}", consecutive_read_failures_,
                    result.error());
     }
+    // Sustained staleness escalates to ERROR: the exported joint state has been FROZEN at the
+    // last good read this whole time (deliberate anti-latch hold, see below) and every consumer —
+    // path follower, behaviour, TF via robot_state_publisher — is acting on a stale arm pose
+    // without any way to know. The log line is currently the ONLY staleness signal downstream.
+    if (consecutive_read_failures_ % kStaleEscalateEvery == 0) {
+      spdlog::error(
+          "FeetechHardwareInterface::read: joint states STALE for {} cycles (~{:.1f} s) — bus "
+          "unresponsive, consumers are tracking a frozen arm pose",
+          consecutive_read_failures_, consecutive_read_failures_ * 0.01);
+    }
     // An outage this long can be a brownout-reset servo: its volatile torque-enable register
     // cleared, the joint is limp until rewritten. Heal once the bus answers again.
     if (consecutive_read_failures_ == kTorqueRecoveryStreak) {
@@ -473,8 +503,8 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
       }
       commanded_joint_ids.push_back(joint_ids_[i]);
       commanded_positions.push_back(to_commanded_tick(hw_positions_[i]));
-      commanded_speeds.push_back(2400);       // Default speed
-      commanded_accelerations.push_back(50);  // Default acceleration
+      commanded_speeds.push_back(goal_speed_);
+      commanded_accelerations.push_back(goal_acceleration_);
     }
   }
 
