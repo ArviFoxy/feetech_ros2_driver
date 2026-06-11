@@ -198,8 +198,28 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
     for (const auto& [parameter_name, address, sign_bit] :
          {std::tuple{"homing_offset", SMS_STS_OFS_L, SMS_STS_SIGN_BIT_HOMING_OFFSET}}) {
       if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
+        const int target = std::stoi(param_it->second);
+        // Read back what EEPROM currently holds before overwriting: a large
+        // mismatch means something else rewrote the servo since our last run
+        // (e.g. external calibration tooling with a different/stale file) and
+        // the arm has been living in a different zero until now. Warn-only —
+        // the config value is about to be (re)applied either way.
+        std::array<uint8_t, 2> current_buf{};
+        if (communication_protocol_->read(joint_ids_[i], address, &current_buf)) {
+          const int current = feetech_driver::decode_sign_magnitude(
+              feetech_driver::from_sts(
+                  feetech_driver::WordBytes{.low = current_buf[0], .high = current_buf[1]}),
+              sign_bit);
+          if (std::abs(current - target) > 20) {
+            spdlog::warn(
+                "Joint '{}': EEPROM {} was {} but config says {} (delta {} ticks ~ {:.1f} deg) — "
+                "external tooling rewrote it since the last run? Writing the config value.",
+                joint_name, parameter_name, current, target, current - target,
+                std::abs(current - target) * 360.0 / 4096.0);
+          }
+        }
         std::array<uint8_t, 2> buf{};
-        const int value = feetech_driver::encode_sign_magnitude(std::stoi(param_it->second), sign_bit);
+        const int value = feetech_driver::encode_sign_magnitude(target, sign_bit);
         feetech_driver::to_sts(&buf[0], &buf[1], value);
         const auto result = communication_protocol_->write(joint_ids_[i], address, buf);
         if (!result) {
