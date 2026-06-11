@@ -65,5 +65,11 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   int consecutive_write_failures_ = 0;
   bool needs_torque_recovery_ = false;
   void recover_torque_();
+
+  // Per-servo working-status byte from the last sync_read (0 = healthy); edge-triggered fault
+  // logging so a tripped protection (overload/overheat/...) is visible the cycle it happens.
+  std::vector<uint8_t> last_servo_statuses_;
+  void report_servo_faults_(const std::vector<uint8_t>& statuses);
+  void log_firmware_versions_();
 };
 }  // namespace feetech_ros2_driver

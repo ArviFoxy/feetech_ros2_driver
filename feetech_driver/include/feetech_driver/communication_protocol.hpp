@@ -149,10 +149,14 @@ class CommunicationProtocol {
 
   /// TODO: Should we pass the length and this returns Expected<std::vector<std::vector<uint8_t>>>?
   /// Sync Read
+  /// @param statuses Optional out: per-servo working-status byte from each response packet (same
+  ///        bit layout as the Servo Status register, addr 65 — bit0 voltage, bit1 sensor,
+  ///        bit2 temperature, bit3 current, bit4 angle, bit5 overload; 0 = healthy).
   template <std::size_t N>
   Result sync_read(const std::vector<uint8_t>& ids,
                    const uint8_t memory_address,
-                   std::vector<std::array<uint8_t, N>>* data) {
+                   std::vector<std::array<uint8_t, N>>* data,
+                   std::vector<uint8_t>* statuses = nullptr) {
     // The bus is strict request-response: anything buffered BEFORE a new request is the tail of
     // an earlier failed/late response. Reading it would desync every subsequent cycle (one 5 ms
     // hiccup then wedges the bus until a port reopen) — drop it so each request starts clean.
@@ -186,6 +190,9 @@ class CommunicationProtocol {
     }
 
     data->resize(ids.size());
+    if (statuses != nullptr) {
+      statuses->assign(ids.size(), 0);
+    }
     for (size_t i = 0; i < ids.size(); ++i) {
       std::array<uint8_t, 3> response_buffer{};  // ID, Effective Data length, Working status
       uint8_t checksum{};
@@ -200,6 +207,9 @@ class CommunicationProtocol {
       if (static_cast<std::byte>(calculated_checksum) != static_cast<std::byte>(checksum)) {
         return tl::make_unexpected(fmt::format(
             "CommunicationProtocol::sync_read [calculated_checksum={}, checksum={}]", calculated_checksum, checksum));
+      }
+      if (statuses != nullptr) {
+        statuses->at(i) = response_buffer[2];
       }
     }
     return {};

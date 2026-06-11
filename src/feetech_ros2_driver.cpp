@@ -42,7 +42,28 @@ CallbackReturn FeetechHardwareInterface::on_init(const hardware_interface::Hardw
     return CallbackReturn::ERROR;
   }
 
+  log_firmware_versions_();
+
   return CallbackReturn::SUCCESS;
+}
+
+void FeetechHardwareInterface::log_firmware_versions_() {
+  // Firmware 3.9 corrupts SYNC READ status packets (fixed in 3.10, huggingface/lerobot#1010) —
+  // surface the per-servo version at startup so that failure mode is diagnosable, not guessed.
+  for (const auto id : joint_ids_) {
+    const auto fw = communication_protocol_->read_word(id, SMS_STS_FIRMWARE_VER_L);
+    if (!fw) {
+      spdlog::warn("FeetechHardwareInterface: read firmware version (id={}) -> {}", id, fw.error());
+      continue;
+    }
+    const int major = *fw & 0xFF;
+    const int minor = (*fw >> 8) & 0xFF;
+    if (major < 3 || (major == 3 && minor < 10)) {
+      spdlog::warn("Servo id={} firmware {}.{} — SYNC READ is unreliable on firmware < 3.10", id, major, minor);
+    } else {
+      spdlog::info("Servo id={} firmware {}.{}", id, major, minor);
+    }
+  }
 }
 
 CallbackReturn FeetechHardwareInterface::init_transport_() {
@@ -273,7 +294,9 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   // 4 = 2 bytes for position + 2 bytes for speed
   std::vector<std::array<uint8_t, 4>> data;
   data.reserve(joint_ids_.size());
-  if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
+  std::vector<uint8_t> statuses;
+  if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data, &statuses);
+      !result) {
     // Transient bus hiccups (a late/lost/corrupt response under load) self-heal: sync_read drops
     // stale bytes before each request, so one bad packet costs one cycle. Hold the last state and
     // retry next cycle — returning ERROR would latch the component until a node restart.
@@ -304,15 +327,48 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   if (needs_torque_recovery_) {
     recover_torque_();
   }
+  report_servo_faults_(statuses);
   ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
     const auto& [index, readings] = values;
     state_hw_positions_[index] = feetech_driver::to_radians(
         feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[0], .high = readings[1]}) -
         feetech_driver::kStsMidpoint);
-    state_hw_velocities_[index] = feetech_driver::to_radians(
-        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}));
+    // Present speed is sign-magnitude (BIT15 = direction) — without decoding, reverse rotation
+    // reads as ~+50 rad/s instead of negative.
+    state_hw_velocities_[index] = feetech_driver::to_radians(feetech_driver::decode_sign_magnitude(
+        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}),
+        SMS_STS_SIGN_BIT_VELOCITY));
   });
   return hardware_interface::return_type::OK;
+}
+
+void FeetechHardwareInterface::report_servo_faults_(const std::vector<uint8_t>& statuses) {
+  // Every response packet carries the servo's working-status byte for free (same bit layout as
+  // the Servo Status register, addr 65). Bit 5 is the overload protection: when it trips, the
+  // servo folds output to the "protection torque" (default 20% of max) — the joint sags but
+  // still resists, distinguishable here from a brownout (comm outage + cleared torque switch).
+  static constexpr std::array<const char*, 6> kFaultBits = {"voltage",     "sensor", "overheat",
+                                                            "overcurrent", "angle",  "overload"};
+  last_servo_statuses_.resize(statuses.size(), 0);
+  for (size_t i = 0; i < statuses.size(); ++i) {
+    if (statuses[i] == last_servo_statuses_[i]) {
+      continue;
+    }
+    if (statuses[i] != 0) {
+      std::string faults;
+      for (size_t bit = 0; bit < kFaultBits.size(); ++bit) {
+        if (statuses[i] & (1u << bit)) {
+          faults += faults.empty() ? "" : "+";
+          faults += kFaultBits[bit];
+        }
+      }
+      spdlog::warn("Servo id={} ('{}') FAULT [{}] (status=0x{:02x})", joint_ids_[i], info_.joints[i].name, faults,
+                   statuses[i]);
+    } else {
+      spdlog::info("Servo id={} ('{}') fault cleared", joint_ids_[i], info_.joints[i].name);
+    }
+    last_servo_statuses_[i] = statuses[i];
+  }
 }
 
 hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Time& /* time */,
