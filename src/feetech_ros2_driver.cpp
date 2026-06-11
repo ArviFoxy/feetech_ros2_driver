@@ -1,6 +1,7 @@
 #include <fmt/ranges.h>
 
 #include <algorithm>
+#include <cmath>
 #include <feetech_driver/common.hpp>
 #include <feetech_driver/communication_protocol.hpp>
 #include <feetech_ros2_driver/feetech_ros2_driver.hpp>
@@ -13,6 +14,18 @@
 #include <string_view>
 #include <tuple>
 #include <vector>
+
+namespace {
+// Clamp a commanded position to what the sign-magnitude goal register can encode (bit15 -> ±32767).
+// Deliberately NOT clamped to a single turn (0..4095): that would defeat multi-turn mode. ±pi is
+// only ±2048 ticks around center, far inside this bound, and the URDF already bounds the command —
+// so this is a safety net that keeps encode_sign_magnitude from throwing out of the realtime loop.
+constexpr int kMaxEncodableTick = (1 << SMS_STS_SIGN_BIT_POSITION) - 1;  // 32767
+inline int to_commanded_tick(double rad) {
+  return std::clamp(feetech_driver::from_radians(rad) + feetech_driver::kStsMidpoint, -kMaxEncodableTick,
+                    kMaxEncodableTick);
+}
+}  // namespace
 
 namespace feetech_ros2_driver {
 #if HARDWARE_INTERFACE_VERSION_GTE(4, 34, 0)
@@ -155,6 +168,14 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
       spdlog::warn("Joint '{}': 'offset' param is deprecated and ignored — use 'homing_offset' instead", joint_name);
     }
 
+    // Multi-turn opt-in (e.g. a free-spinning wrist): the driver sets MIN==MAX angle-limit = 0 below
+    // to select absolute multi-turn mode, which removes the single-turn encoder-seam wall. The
+    // range_min/range_max window is meaningless once that wall is gone, so it is skipped.
+    const bool multi_turn = [&] {
+      const auto it = merged_params.find("multi_turn");
+      return it != merged_params.end() && (it->second == "true" || it->second == "1");
+    }();
+
     // Disable torque and unlock EPROM before writing parameters
     if (const auto result = communication_protocol_->disable_torque(joint_ids_[i]); !result) {
       spdlog::error("FeetechHardwareInterface::configure_joints_ disable_torque -> {}", result.error());
@@ -183,12 +204,47 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
                                                   {"range_max", SMS_STS_MAX_ANGLE_LIMIT_L},
                                                   {"max_torque_limit", SMS_STS_MAX_TORQUE_L},
                                                   {"protection_current", SMS_STS_PROTECTION_CURRENT_L}}) {
+      // A multi-turn joint has no single-turn angle-limit window; MIN/MAX are forced to 0 below.
+      if (multi_turn && (std::string_view(parameter_name) == "range_min" ||
+                         std::string_view(parameter_name) == "range_max")) {
+        continue;
+      }
       if (const auto param_it = merged_params.find(parameter_name); param_it != merged_params.end()) {
         std::array<uint8_t, 2> buf{};
         feetech_driver::to_sts(&buf[0], &buf[1], std::stoi(param_it->second));
         const auto result = communication_protocol_->write(joint_ids_[i], address, buf);
         if (!result) {
           spdlog::error("FeetechHardwareInterface::configure_joints_ -> {}", result.error());
+          return CallbackReturn::ERROR;
+        }
+      }
+    }
+
+    // Multi-turn position mode: MIN==MAX==0 (datasheet §7-13) selects absolute multi-turn (±7 rev),
+    // removing the single-turn encoder-seam wall that otherwise jams a free-spinning joint. MODE
+    // reg 33 is forced to 0 (position) so a servo left in wheel/step mode is recovered. EEPROM
+    // writes are skipped when the register already holds the target value (write-cycle wear).
+    if (multi_turn) {
+      for (const auto address : {SMS_STS_MIN_ANGLE_LIMIT_L, SMS_STS_MAX_ANGLE_LIMIT_L}) {
+        std::array<uint8_t, 2> current_buf{};
+        if (communication_protocol_->read(joint_ids_[i], address, &current_buf) && current_buf[0] == 0 &&
+            current_buf[1] == 0) {
+          continue;  // already 0 — don't burn an EEPROM write
+        }
+        const std::array<uint8_t, 2> buf{0, 0};
+        if (const auto result = communication_protocol_->write(joint_ids_[i], address, buf); !result) {
+          spdlog::error("FeetechHardwareInterface::configure_joints_ multi_turn angle-limit -> {}", result.error());
+          return CallbackReturn::ERROR;
+        }
+      }
+      std::array<uint8_t, 1> mode_buf{};
+      const bool already_position =
+          communication_protocol_->read(joint_ids_[i], SMS_STS_MODE, &mode_buf) && mode_buf[0] == 0;
+      if (!already_position) {
+        if (const auto result =
+                communication_protocol_->set_mode(joint_ids_[i], feetech_driver::OperationMode::kPosition);
+            !result) {
+          spdlog::error("FeetechHardwareInterface::configure_joints_ set_mode -> {}", result.error());
           return CallbackReturn::ERROR;
         }
       }
@@ -210,6 +266,9 @@ CallbackReturn FeetechHardwareInterface::configure_joints_(const JointIdConfigMa
               feetech_driver::from_sts(
                   feetech_driver::WordBytes{.low = current_buf[0], .high = current_buf[1]}),
               sign_bit);
+          if (current == target) {
+            continue;  // EEPROM already holds the target — don't burn a write cycle
+          }
           if (std::abs(current - target) > 20) {
             spdlog::warn(
                 "Joint '{}': EEPROM {} was {} but config says {} (delta {} ticks ~ {:.1f} deg) — "
@@ -350,8 +409,13 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   report_servo_faults_(statuses);
   ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
     const auto& [index, readings] = values;
+    // Present position is sign-magnitude (BIT15 = sign). Single-turn keeps it in 0..4095 (sign
+    // clear) so decoding is a no-op there; in multi-turn it goes negative just below -pi, where
+    // skipping the decode would misread ~+47 rad and lunge. Mirrors the velocity decode below.
     state_hw_positions_[index] = feetech_driver::to_radians(
-        feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[0], .high = readings[1]}) -
+        feetech_driver::decode_sign_magnitude(
+            feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[0], .high = readings[1]}),
+            SMS_STS_SIGN_BIT_POSITION) -
         feetech_driver::kStsMidpoint);
     // Present speed is sign-magnitude (BIT15 = direction) — without decoding, reverse rotation
     // reads as ~+50 rad/s instead of negative.
@@ -402,8 +466,13 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
   for (uint i = 0; i < info_.joints.size(); i++) {
     // Only include joints with command interfaces
     if (!info_.joints[i].command_interfaces.empty()) {
+      // hw_positions_ starts as NaN until the controller writes a setpoint; from_radians(NaN) ->
+      // static_cast<int>(NaN) is UB and would emit a garbage goal. Skip until a real value arrives.
+      if (std::isnan(hw_positions_[i])) {
+        continue;
+      }
       commanded_joint_ids.push_back(joint_ids_[i]);
-      commanded_positions.push_back(feetech_driver::from_radians(hw_positions_[i]) + feetech_driver::kStsMidpoint);
+      commanded_positions.push_back(to_commanded_tick(hw_positions_[i]));
       commanded_speeds.push_back(2400);       // Default speed
       commanded_accelerations.push_back(50);  // Default acceleration
     }

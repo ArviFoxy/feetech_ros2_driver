@@ -22,6 +22,7 @@ Make sure to look at [Memory table](https://docs.google.com/spreadsheets/d/1GVs7
 * `homing_offset` (optional): Signed offset written to the servo's EEPROM. The servo firmware applies `Present_Position = Actual_Position - Homing_Offset`, so setting `homing_offset = actual_position - 2048` makes the servo report 2048 (center) at your desired physical center. If migrating from the old `offset` parameter: `homing_offset = old_offset - 2048` (since the old offset was effectively the actual position at center).
 * `range_min` (optional): Minimum angle limit (raw ticks, after homing offset is applied).
 * `range_max` (optional): Maximum angle limit (raw ticks, after homing offset is applied).
+* `multi_turn` (optional, bool): When `true`, selects **absolute multi-turn** position mode by writing both angle-limit registers to 0 (and forcing operating mode 0 = position). This removes the single-turn magnetic-encoder seam (raw 4095↔0), which is otherwise an un-crossable wall that jams a free-spinning joint commanded past it. `range_min`/`range_max` are ignored for that joint (multi-turn has no single-turn window). Note: the servo does **not** retain the turn count across power-off (absolute position within ±7 turns), so park near zero before powering down.
 * `max_torque_limit` (optional): Maximum torque limit.
 * `protection_current` (optional): Protection current threshold.
 * `overload_torque` (optional): Overload torque threshold.
