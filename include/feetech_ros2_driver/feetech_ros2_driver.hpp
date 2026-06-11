@@ -55,5 +55,15 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   CallbackReturn load_yaml_config_and_warn_(JointIdConfigMap& out_yaml);
   CallbackReturn configure_joints_(const JointIdConfigMap& yaml_by_id);
   CallbackReturn validate_model_series_();
+
+  // Comm self-healing (see read()/write()): a transient bus error must NEVER surface as
+  // return_type::ERROR — ros2_control latches the whole component on the first ERROR and only a
+  // node restart revives it (observed live: one 5 ms read timeout froze the arm permanently).
+  static constexpr int kTorqueRecoveryStreak = 10;  // outage cycles before assuming brownout-reset
+  static constexpr int kReconnectEvery = 200;       // outage cycles between port-reopen attempts
+  int consecutive_read_failures_ = 0;
+  int consecutive_write_failures_ = 0;
+  bool needs_torque_recovery_ = false;
+  void recover_torque_();
 };
 }  // namespace feetech_ros2_driver

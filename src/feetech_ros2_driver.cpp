@@ -274,8 +274,35 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
   std::vector<std::array<uint8_t, 4>> data;
   data.reserve(joint_ids_.size());
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data); !result) {
-    spdlog::error("FeetechHardwareInterface::read -> {}", result.error());
-    return hardware_interface::return_type::ERROR;
+    // Transient bus hiccups (a late/lost/corrupt response under load) self-heal: sync_read drops
+    // stale bytes before each request, so one bad packet costs one cycle. Hold the last state and
+    // retry next cycle — returning ERROR would latch the component until a node restart.
+    ++consecutive_read_failures_;
+    if (consecutive_read_failures_ <= 3 || consecutive_read_failures_ % 100 == 0) {
+      spdlog::warn("FeetechHardwareInterface::read ({} consecutive failures) -> {}", consecutive_read_failures_,
+                   result.error());
+    }
+    // An outage this long can be a brownout-reset servo: its volatile torque-enable register
+    // cleared, the joint is limp until rewritten. Heal once the bus answers again.
+    if (consecutive_read_failures_ == kTorqueRecoveryStreak) {
+      needs_torque_recovery_ = true;
+    }
+    // A persistent outage can also be a wedged tty / USB hiccup: periodically reopen the port.
+    if (consecutive_read_failures_ % kReconnectEvery == 0) {
+      spdlog::error("FeetechHardwareInterface::read: bus unresponsive for {} cycles, reopening serial port",
+                    consecutive_read_failures_);
+      if (const auto reconnect_result = communication_protocol_->reconnect(); !reconnect_result) {
+        spdlog::error("FeetechHardwareInterface::read reconnect -> {}", reconnect_result.error());
+      }
+    }
+    return hardware_interface::return_type::OK;
+  }
+  if (consecutive_read_failures_ > 0) {
+    spdlog::info("FeetechHardwareInterface::read: bus recovered after {} failed cycles", consecutive_read_failures_);
+    consecutive_read_failures_ = 0;
+  }
+  if (needs_torque_recovery_) {
+    recover_torque_();
   }
   ranges::for_each(data | ranges::views::enumerate, [&](const auto& values) {
     const auto& [index, readings] = values;
@@ -311,12 +338,47 @@ hardware_interface::return_type FeetechHardwareInterface::write(const rclcpp::Ti
     const auto write_result = communication_protocol_->sync_write_position(
         commanded_joint_ids, commanded_positions, commanded_speeds, commanded_accelerations);
     if (!write_result) {
-      spdlog::error("FeetechHardwareInterface::write -> {}", write_result.error());
-      return hardware_interface::return_type::ERROR;
+      // Same policy as read(): a transient failure must not latch the component (sync_write is
+      // fire-and-forget broadcast, so a failure here is port-level). Retry next cycle.
+      ++consecutive_write_failures_;
+      if (consecutive_write_failures_ <= 3 || consecutive_write_failures_ % 100 == 0) {
+        spdlog::warn("FeetechHardwareInterface::write ({} consecutive failures) -> {}", consecutive_write_failures_,
+                     write_result.error());
+      }
+      return hardware_interface::return_type::OK;
     }
+    consecutive_write_failures_ = 0;
   }
 
   return hardware_interface::return_type::OK;
+}
+
+void FeetechHardwareInterface::recover_torque_() {
+  // After a comm outage a servo may have brownout-reset: EEPROM config survives, but the volatile
+  // torque-enable register cleared — the joint is limp until rewritten. Same goal-sync-then-
+  // torque-on dance as configure_joints_ (writing torque-on with a stale Goal_Position would
+  // lunge). No-op for servos that kept power. Any failure: keep the flag, retry next cycle.
+  for (size_t i = 0; i < info_.joints.size(); ++i) {
+    if (info_.joints[i].command_interfaces.empty()) {
+      continue;
+    }
+    const auto present = communication_protocol_->read_position(joint_ids_[i]);
+    if (!present) {
+      spdlog::warn("FeetechHardwareInterface::recover_torque_ read_position(id={}) -> {}", joint_ids_[i],
+                   present.error());
+      return;
+    }
+    if (const auto result = communication_protocol_->write_position(joint_ids_[i], *present, 0, 0); !result) {
+      spdlog::warn("FeetechHardwareInterface::recover_torque_ goal sync(id={}) -> {}", joint_ids_[i], result.error());
+      return;
+    }
+    if (const auto result = communication_protocol_->set_torque(joint_ids_[i], true); !result) {
+      spdlog::warn("FeetechHardwareInterface::recover_torque_ set_torque(id={}) -> {}", joint_ids_[i], result.error());
+      return;
+    }
+  }
+  needs_torque_recovery_ = false;
+  spdlog::info("FeetechHardwareInterface: torque re-enabled on all commanded joints after comm outage");
 }
 
 CallbackReturn FeetechHardwareInterface::on_activate(const rclcpp_lifecycle::State& /* previous_state */) {

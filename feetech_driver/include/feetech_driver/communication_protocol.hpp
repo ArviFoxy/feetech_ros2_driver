@@ -141,12 +141,23 @@ class CommunicationProtocol {
   Result lock_eprom(uint8_t id);
   Result unlock_eprom(uint8_t id);
 
+  /// Close and reopen the serial port (recovery from a wedged tty / USB hiccup).
+  Result reconnect() {
+    (void)serial_port_->close();
+    return serial_port_->configure();
+  }
+
   /// TODO: Should we pass the length and this returns Expected<std::vector<std::vector<uint8_t>>>?
   /// Sync Read
   template <std::size_t N>
   Result sync_read(const std::vector<uint8_t>& ids,
                    const uint8_t memory_address,
                    std::vector<std::array<uint8_t, N>>* data) {
+    // The bus is strict request-response: anything buffered BEFORE a new request is the tail of
+    // an earlier failed/late response. Reading it would desync every subsequent cycle (one 5 ms
+    // hiccup then wedges the bus until a port reopen) — drop it so each request starts clean.
+    (void)serial_port_->flashInputBuffer();
+
     std::array<uint8_t, 7> buffer{{0,
                                    0,
                                    kBroadcastId,
