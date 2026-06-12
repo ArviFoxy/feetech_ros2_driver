@@ -47,6 +47,14 @@ class FeetechHardwareInterface : public hardware_interface::SystemInterface {
   std::vector<double> hw_positions_;
   std::vector<double> state_hw_positions_;
   std::vector<double> state_hw_velocities_;
+  // Present_Load exported as the EFFORT state interface, as a signed FRACTION of stall torque
+  // [-1, 1] (the servo reports 0.1% units; no N*m fiction — the torque constant is not modeled).
+  std::vector<double> state_hw_efforts_;
+  // Edge-triggered temperature/voltage warnings (read for free in the same sync_read window):
+  // 0 = ok, 1 = warn, 2 = error per servo, so each level transition logs exactly once.
+  std::vector<uint8_t> last_temp_level_;
+  std::vector<uint8_t> last_volt_level_;
+  void report_temperature_voltage_(std::size_t index, uint8_t voltage_raw, uint8_t temperature_c);
   std::vector<uint8_t> previous_hw_positions_;
 
   std::vector<uint8_t> joint_ids_;

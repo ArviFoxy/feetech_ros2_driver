@@ -368,9 +368,12 @@ std::vector<hardware_interface::StateInterface> FeetechHardwareInterface::export
   std::vector<hardware_interface::StateInterface> state_interfaces;
   state_hw_positions_.resize(info_.joints.size(), 0.0);
   state_hw_velocities_.resize(info_.joints.size(), 0.0);
+  state_hw_efforts_.resize(info_.joints.size(), 0.0);
   for (uint i = 0; i < info_.joints.size(); i++) {
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &state_hw_positions_[i]);
     state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &state_hw_velocities_[i]);
+    // Effort = Present_Load as a signed fraction of stall torque [-1, 1] (NOT N*m; see header).
+    state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &state_hw_efforts_[i]);
   }
 
   return state_interfaces;
@@ -390,8 +393,10 @@ std::vector<hardware_interface::CommandInterface> FeetechHardwareInterface::expo
 
 hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Time& /* time */,
                                                                const rclcpp::Duration& /* period */) {
-  // 4 = 2 bytes for position + 2 bytes for speed
-  std::vector<std::array<uint8_t, 4>> data;
+  // 8 contiguous bytes per servo (regs 56-63): position(2) + speed(2) + load(2) + voltage(1) +
+  // temperature(1) — load/voltage/temp ride the SAME bus transaction as the position read
+  // (~4 extra bytes per servo per cycle at 1 Mbps, negligible).
+  std::vector<std::array<uint8_t, 8>> data;
   data.reserve(joint_ids_.size());
   std::vector<uint8_t> statuses;
   if (auto result = communication_protocol_->sync_read(joint_ids_, SMS_STS_PRESENT_POSITION_L, &data, &statuses);
@@ -452,8 +457,51 @@ hardware_interface::return_type FeetechHardwareInterface::read(const rclcpp::Tim
     state_hw_velocities_[index] = feetech_driver::to_radians(feetech_driver::decode_sign_magnitude(
         feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[2], .high = readings[3]}),
         SMS_STS_SIGN_BIT_VELOCITY));
+    // Present load: sign-magnitude (BIT10 = direction), magnitude in 0.1% of stall torque ->
+    // exported as the effort state interface, a signed FRACTION of stall torque [-1, 1]. This is
+    // the gravity/stall observability signal (joint_state_broadcaster publishes it for free).
+    state_hw_efforts_[index] =
+        static_cast<double>(feetech_driver::decode_sign_magnitude(
+            feetech_driver::from_sts(feetech_driver::WordBytes{.low = readings[4], .high = readings[5]}),
+            SMS_STS_SIGN_BIT_LOAD)) /
+        1000.0;
+    report_temperature_voltage_(index, readings[6], readings[7]);
   });
   return hardware_interface::return_type::OK;
+}
+
+void FeetechHardwareInterface::report_temperature_voltage_(std::size_t index, uint8_t voltage_raw,
+                                                           uint8_t temperature_c) {
+  // Early warning BEFORE the firmware protections trip (over-temp cutoff ~70 C, voltage window in
+  // EEPROM): edge-triggered per level so a hot afternoon doesn't spam the log at 100 Hz.
+  last_temp_level_.resize(joint_ids_.size(), 0);
+  last_volt_level_.resize(joint_ids_.size(), 0);
+  const double volts = 0.1 * voltage_raw;
+  const uint8_t temp_level = (temperature_c >= 65) ? 2 : (temperature_c >= 55) ? 1 : 0;
+  if (temp_level != last_temp_level_[index]) {
+    if (temp_level == 2) {
+      spdlog::error("Servo id={} ('{}') temperature {} C — overheat protection imminent (~70 C)",
+                    joint_ids_[index], info_.joints[index].name, temperature_c);
+    } else if (temp_level == 1) {
+      spdlog::warn("Servo id={} ('{}') temperature {} C — running hot", joint_ids_[index],
+                   info_.joints[index].name, temperature_c);
+    } else {
+      spdlog::info("Servo id={} ('{}') temperature back to {} C", joint_ids_[index],
+                   info_.joints[index].name, temperature_c);
+    }
+    last_temp_level_[index] = temp_level;
+  }
+  const uint8_t volt_level = (volts < 6.0 || volts > 8.6) ? 1 : 0;
+  if (volt_level != last_volt_level_[index]) {
+    if (volt_level == 1) {
+      spdlog::warn("Servo id={} ('{}') bus voltage {:.1f} V outside [6.0, 8.6] (7.4 V nominal)",
+                   joint_ids_[index], info_.joints[index].name, volts);
+    } else {
+      spdlog::info("Servo id={} ('{}') bus voltage back to {:.1f} V", joint_ids_[index],
+                   info_.joints[index].name, volts);
+    }
+    last_volt_level_[index] = volt_level;
+  }
 }
 
 void FeetechHardwareInterface::report_servo_faults_(const std::vector<uint8_t>& statuses) {

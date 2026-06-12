@@ -13,6 +13,10 @@ The feetech system interface has a few `ros2_control` urdf tags to customize its
 * `goal_speed` (optional, default 2400): Speed value (0–2400 steps/s, 0 = unlimited) written with **every** position command. The servo re-profiles each goal with this on top of whatever time-parameterization the controller already applied — be aware of the double profiling when tuning trajectory tracking.
 * `goal_acceleration` (optional, default 50): Acceleration value (0–255, ×100 steps/s²) written with every position command. Same double-profiling caveat. Note this is the per-command register (41), distinct from the per-joint EEPROM `acceleration` parameter.
 
+#### State interfaces
+
+The driver exports `position` [rad], `velocity` [rad/s] and `effort` per joint. **`effort` is Present_Load as a signed fraction of stall torque [-1, 1]** (the servo reports 0.1 % units; the torque constant is not modeled so no N·m is invented). Load, bus voltage and temperature ride the same sync_read transaction as position/speed (registers 56–63, ~4 extra bytes/servo/cycle). Voltage and temperature are not exported as interfaces; the driver logs edge-triggered warnings instead (temperature ≥ 55 °C WARN / ≥ 65 °C ERROR, voltage outside 6.0–8.6 V WARN) — early signal before the firmware protections trip.
+
 #### Per-joint Parameters
 
 Make sure to look at [Memory table](https://docs.google.com/spreadsheets/d/1GVs7W1VS1PqdhA1nW-abeyAHhTUxKUdR/edit?gid=364516031#gid=364516031) for a detailed explanation of the parameters.

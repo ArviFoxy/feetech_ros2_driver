@@ -79,3 +79,5 @@
 #define SMS_STS_SIGN_BIT_HOMING_OFFSET 11
 #define SMS_STS_SIGN_BIT_POSITION 15
 #define SMS_STS_SIGN_BIT_VELOCITY 15
+// Present_Load: bits 0-9 = magnitude in 0.1% of stall torque (0-1000), bit 10 = direction.
+#define SMS_STS_SIGN_BIT_LOAD 10
